@@ -805,5 +805,290 @@ mod tests {
         reader.read(&mut buf).unwrap();
         assert_eq!(&buf, &[5, 6, 7]);
     }
+
+    #[test]
+    fn read_to_end() {
+        let data: Vec<u8> = (0..100).collect();
+        let cursor: Cursor<Vec<u8>> = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(20, 2, cursor);
+
+        let mut result = Vec::new();
+        reader.read_to_end(&mut result).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn read_exact() {
+        let data: Vec<u8> = (0..50).collect();
+        let cursor: Cursor<Vec<u8>> = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        let mut buf = vec![0; 30];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, &data[..30]);
+        assert_eq!(reader.position(), 30);
+    }
+
+    #[test]
+    fn read_exact_partial() {
+        let data: Vec<u8> = (0..15).collect();
+        let cursor: Cursor<Vec<u8>> = Cursor::new(data);
+        let mut reader = SmartBuf::with_capacity(5, 2, cursor);
+
+        let mut buf = vec![0; 10];
+        reader.read_exact(&mut buf).unwrap();
+        
+        // Should fail on second read_exact since we've exhausted data
+        let mut buf2 = vec![0; 10];
+        assert!(reader.read_exact(&mut buf2).is_err());
+    }
+
+    #[test]
+    fn various_buffer_sizes() {
+        let text = b"The quick brown fox jumps over the lazy dog";
+        let n = text.len() + 3;
+
+        // Test various combinations of buffer sizes and queue lengths
+        for channel_bufsize in (1..n.min(20)).step_by(3) {
+            for queuelen in (1..n.min(10)).step_by(2) {
+                let data = text.to_vec();
+                let cursor = Cursor::new(data.clone());
+                let mut reader = SmartBuf::with_capacity(channel_bufsize, queuelen, cursor);
+
+                let mut result = Vec::new();
+                reader.read_to_end(&mut result).unwrap();
+                assert_eq!(result, data, 
+                    "Failed at bufsize: {}, queuelen: {}", channel_bufsize, queuelen);
+            }
+        }
+    }
+
+    #[test]
+    fn seek_start_comprehensive() {
+        let data: Vec<u8> = (0..17).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Seek to position 3 and read
+        reader.seek(SeekFrom::Start(3)).unwrap();
+        let mut buf = [0; 8];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(&buf, &[3, 4, 5, 6, 7, 8, 9, 10]);
+
+        // Seek back to start
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf = [0; 8];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(&buf, &[0, 1, 2, 3, 4, 5, 6, 7]);
+
+        // Seek to near end
+        reader.seek(SeekFrom::Start(13)).unwrap();
+        let mut buf = [0; 8];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf[..n], &[13, 14, 15, 16]);
+
+        // Seek back to start again
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf = [0; 8];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(&buf, &[0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn seek_current_comprehensive() {
+        let data: Vec<u8> = (0..17).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(20, 2, cursor);
+
+        // Seek forward from start
+        reader.seek(SeekFrom::Current(2)).unwrap();
+        let mut buf = [0; 8];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(&buf, &[2, 3, 4, 5, 6, 7, 8, 9]);
+
+        // Seek forward again
+        reader.seek(SeekFrom::Current(6)).unwrap();
+        let mut buf = [0; 8];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(&buf[..n], &[16]);
+    }
+
+    #[test]
+    fn seek_current_negative_comprehensive() {
+        let data: Vec<u8> = (0..17).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(3, 2, cursor);
+
+        // Read forward first
+        reader.seek(SeekFrom::Current(4)).unwrap();
+        let mut buf = [0; 4];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(&buf, &[4, 5, 6, 7]);
+
+        // Seek backward within buffer
+        reader.seek(SeekFrom::Current(-2)).unwrap();
+        let mut buf = [0; 4];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(&buf, &[6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn multiple_small_reads() {
+        let data: Vec<u8> = (0..50).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read in small chunks
+        for i in 0..10 {
+            let mut buf = [0; 5];
+            let n = reader.read(&mut buf).unwrap();
+            assert_eq!(n, 5);
+            assert_eq!(&buf, &data[i*5..(i+1)*5]);
+        }
+    }
+
+    #[test]
+    fn read_across_buffer_boundaries() {
+        let data: Vec<u8> = (0..30).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read that spans exactly 2 buffers
+        let mut buf = vec![0; 20];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 20);
+        assert_eq!(&buf[..n], &data[..20]);
+
+        // Next read should get remaining data
+        let mut buf = vec![0; 20];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(&buf[..n], &data[20..30]);
+    }
+
+    #[test]
+    fn seek_and_read_sequence() {
+        let data: Vec<u8> = (0..40).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(8, 2, cursor);
+
+        // Read, seek, read sequence
+        let mut buf = [0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(&buf, &[0, 1, 2, 3, 4]);
+
+        reader.seek(SeekFrom::Start(20)).unwrap();
+        reader.read(&mut buf).unwrap();
+        assert_eq!(&buf, &[20, 21, 22, 23, 24]);
+
+        reader.seek(SeekFrom::Start(10)).unwrap();
+        reader.read(&mut buf).unwrap();
+        assert_eq!(&buf, &[10, 11, 12, 13, 14]);
+
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read(&mut buf).unwrap();
+        assert_eq!(&buf, &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn default_constructor() {
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::new(cursor);
+
+        let mut result = Vec::new();
+        reader.read_to_end(&mut result).unwrap();
+        assert_eq!(result.len(), 100);
+        assert_eq!(&result[..10], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn buffer_size_accessor() {
+        let data: Vec<u8> = (0..10).collect();
+        let cursor = Cursor::new(data);
+        let reader = SmartBuf::with_capacity(123, 2, cursor);
+        assert_eq!(reader.buffer_size(), 123);
+    }
+
+    #[test]
+    fn read_after_seek_to_end() {
+        let data: Vec<u8> = (0..10).collect();
+        let cursor = Cursor::new(data);
+        let mut reader = SmartBuf::with_capacity(5, 2, cursor);
+
+        // Seek to end
+        reader.seek(SeekFrom::End(0)).unwrap();
+        let mut buf = [0; 5];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn seek_from_end_negative() {
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(5, 2, cursor);
+
+        // Seek from end with negative offset
+        reader.seek(SeekFrom::End(-5)).unwrap();
+        let mut buf = [0; 10];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..n], &[15, 16, 17, 18, 19]);
+    }
+
+    #[test]
+    fn seek_current_zero() {
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read some data
+        let mut buf = [0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(reader.position(), 5);
+
+        // Seek current by 0 (should be no-op)
+        reader.seek(SeekFrom::Current(0)).unwrap();
+        assert_eq!(reader.position(), 5);
+
+        // Should continue reading from same position
+        reader.read(&mut buf).unwrap();
+        assert_eq!(&buf, &[5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn large_queue_length() {
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 10, cursor);
+
+        let mut result = Vec::new();
+        reader.read_to_end(&mut result).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn seek_to_very_end_then_read() {
+        let data: Vec<u8> = (0..25).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Seek to end
+        reader.seek(SeekFrom::End(0)).unwrap();
+        
+        // Try to read - should get 0 bytes
+        let mut buf = [0; 10];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+
+        // Seek back a bit
+        reader.seek(SeekFrom::End(-5)).unwrap();
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..n], &[20, 21, 22, 23, 24]);
+    }
 }
 
