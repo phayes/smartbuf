@@ -68,19 +68,20 @@ enum Command {
 ///
 /// ```
 /// use smartbuf::SmartBuf;
-/// use std::io::{Read, Seek, SeekFrom};
-/// use std::fs::File;
+/// use std::io::{Read, Seek, SeekFrom, Cursor};
 ///
-/// # fn main() -> std::io::Result<()> {
-/// let file = File::open("example.txt")?;
-/// let mut reader = SmartBuf::new(file);
+/// let data = b"Hello, world!";
+/// let cursor = Cursor::new(data);
+/// let mut reader = SmartBuf::new(cursor);
 ///
-/// let mut buf = vec![0; 1024];
-/// reader.read(&mut buf)?;
+/// let mut buf = vec![0; 5];
+/// reader.read(&mut buf).unwrap();
+/// assert_eq!(&buf, b"Hello");
 ///
-/// reader.seek(SeekFrom::Start(0))?;
-/// # Ok(())
-/// # }
+/// reader.seek(SeekFrom::Start(0)).unwrap();
+/// let mut buf = vec![0; 5];
+/// reader.read(&mut buf).unwrap();
+/// assert_eq!(&buf, b"Hello");
 /// ```
 pub struct SmartBuf<R: Read + Seek + Send> {
     // Channels for communication with background thread
