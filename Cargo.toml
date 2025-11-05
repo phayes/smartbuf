@@ -3,6 +3,13 @@ name = "smartbuf"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "A high-performance buffered reader with background thread pre-fetching and full seek support."
+authors = ["Patrick Hayes"]
+readme = "README.md"
+repository = "https://github.com/phayes/smartbuf"
+homepage = "https://github.com/phayes/smartbuf"
+keywords = ["buffer", "prefetch", "seek", "io", "performance"]
+categories = ["data-structures"]
 
 [dependencies]
 crossbeam-channel = "0.5"
