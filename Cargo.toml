@@ -1,6 +1,6 @@
 [package]
 name = "smartbuf"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "A high-performance buffered reader with background thread pre-fetching and full seek support."
