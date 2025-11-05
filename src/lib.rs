@@ -103,7 +103,7 @@ pub struct SmartBuf<R: Read + Seek + Send + 'static> {
     bufsize: usize,
 
     // Thread handle for cleanup
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<Option<R>>>,
 
     // Phantom data to track type parameter
     _phantom: PhantomData<R>,
@@ -136,7 +136,7 @@ impl<R: Read + Seek + Send + 'static> SmartBuf<R> {
         let mut background_reader = BackgroundReader::new(empty_recv, full_send, cmd_recv, bufsize);
 
         let handle = thread::spawn(move || {
-            background_reader.serve(reader);
+            background_reader.serve(reader)
         });
 
         SmartBuf {
@@ -162,6 +162,54 @@ impl<R: Read + Seek + Send + 'static> SmartBuf<R> {
     /// Returns the buffer size.
     pub fn buffer_size(&self) -> usize {
         self.bufsize
+    }
+
+    /// Consumes the `SmartBuf` and returns the underlying reader.
+    ///
+    /// This method stops the background thread and returns the reader that was
+    /// being used for buffering. After calling this method, the `SmartBuf` is
+    /// no longer usable.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use smartbuf::SmartBuf;
+    /// use std::io::Cursor;
+    ///
+    /// let cursor = Cursor::new(vec![1, 2, 3, 4, 5]);
+    /// let smart_buf = SmartBuf::new(cursor);
+    ///
+    /// // Get the underlying reader back
+    /// let reader = smart_buf.into_inner().unwrap();
+    /// ```
+    pub fn into_inner(mut self) -> io::Result<R> {
+        // Return current buffer
+        self.return_current_buffer();
+
+        // Send stop command to background thread
+        if let Some(sender) = self.cmd_send.take() {
+            sender.send(Command::Stop).ok();
+        }
+
+        // Wait for background thread to finish and get the reader
+        if let Some(handle) = self.handle.take() {
+            match handle.join() {
+                Ok(Some(reader)) => Ok(reader),
+                Ok(None) => Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "background thread terminated without returning reader",
+                )),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "background thread panicked",
+                )),
+            }
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "background thread handle already taken",
+            ))
+        }
     }
 
     fn return_current_buffer(&mut self) {
@@ -349,7 +397,7 @@ impl<R: Read + Seek + Send + 'static> Drop for SmartBuf<R> {
         if let Some(sender) = self.cmd_send.take() {
             sender.send(Command::Stop).ok();
         }
-        // Wait for background thread to finish
+        // Wait for background thread to finish and drop the reader
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -378,7 +426,7 @@ impl BackgroundReader {
         }
     }
 
-    fn serve<R: Read + Seek>(&mut self, mut reader: R) {
+    fn serve<R: Read + Seek>(&mut self, mut reader: R) -> Option<R> {
         let mut current_pos = 0u64;
         let mut pending_seek = false;
 
@@ -394,10 +442,10 @@ impl BackgroundReader {
                         }
                         Err(e) => {
                             self.full_send.send(Err(e)).ok();
-                            return;
+                            return None;
                         }
                     },
-                    Command::Stop => return,
+                    Command::Stop => return Some(reader),
                 }
             }
 
@@ -411,7 +459,7 @@ impl BackgroundReader {
                         thread::yield_now();
                         continue;
                     }
-                    Err(TryRecvError::Disconnected) => return,
+                    Err(TryRecvError::Disconnected) => return None,
                 }
             };
 
@@ -423,22 +471,22 @@ impl BackgroundReader {
                         Ok(()) => {
                             current_pos += buffer.end as u64;
                             if self.full_send.send(Ok(buffer)).is_err() {
-                                return;
+                                return None;
                             }
                         }
                         Err(e) => {
                             let should_break = e.kind() != io::ErrorKind::Interrupted;
                             if self.full_send.send(Err(e)).is_err() {
-                                return;
+                                return None;
                             }
                             if should_break {
-                                return;
+                                return None;
                             }
                         }
                     }
                 }
-                Ok(None) => return,
-                Err(_) => return,
+                Ok(None) => return Some(reader),
+                Err(_) => return None,
             }
         }
     }
@@ -2053,5 +2101,47 @@ mod tests {
         let n = reader.read(&mut buf).unwrap();
         assert_eq!(n, 10);
         assert_eq!(&buf, &data[10..20]);
+    }
+
+    #[test]
+    fn test_into_inner() {
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let smart_buf = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Unwrap to get the underlying reader back
+        let reader = smart_buf.into_inner().unwrap();
+
+        // Verify we can use the reader again
+        let mut new_smart_buf = SmartBuf::new(reader);
+        let mut buf = vec![0; 5];
+        let n = new_smart_buf.read(&mut buf).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf, &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_into_inner_after_reads() {
+        let data: Vec<u8> = (0..30).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut smart_buf = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read some data
+        let mut buf = vec![0; 10];
+        smart_buf.read(&mut buf).unwrap();
+        assert_eq!(&buf, &data[..10]);
+
+        // Unwrap to get the underlying reader back
+        let reader = smart_buf.into_inner().unwrap();
+
+        // Verify we can create a new SmartBuf from the reader
+        // Note: The reader's position might be at the end due to background buffering,
+        // so we'll seek to start and read from there
+        let mut new_smart_buf = SmartBuf::new(reader);
+        new_smart_buf.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf = vec![0; 5];
+        let n = new_smart_buf.read(&mut buf).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf, &[0, 1, 2, 3, 4]);
     }
 }
