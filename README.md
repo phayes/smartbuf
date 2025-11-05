@@ -1,5 +1,8 @@
 # smartbuf
 
+[![Crates.io](https://img.shields.io/crates/v/smartbuf.svg)](https://crates.io/crates/smartbuf)
+[![docs.rs](https://docs.rs/smartbuf/badge.svg)](https://docs.rs/smartbuf)
+
 A high-performance buffered reader with background thread pre-fetching and full seek support.
 
 `SmartBuf` wraps any `Read + Seek` implementation and provides:
