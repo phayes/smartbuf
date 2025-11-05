@@ -1,7 +1,8 @@
+use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded as channel};
+use std::convert::TryFrom;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::marker::PhantomData;
 use std::thread::{self, JoinHandle};
-use crossbeam_channel::{unbounded as channel, Receiver, Sender};
 
 const DEFAULT_BUF_SIZE: usize = 8 * 1024;
 const DEFAULT_QUEUE_LEN: usize = 2;
@@ -11,6 +12,7 @@ struct Buffer {
     data: Box<[u8]>,
     start_pos: u64,  // Absolute position where this buffer starts
     end: usize,      // Valid data end in buffer
+    generation: u64, // Generation identifier for this buffer
 }
 
 impl Buffer {
@@ -20,6 +22,7 @@ impl Buffer {
             data: vec![0; size].into_boxed_slice(),
             start_pos,
             end: 0,
+            generation: 0,
         }
     }
 
@@ -54,7 +57,7 @@ impl Buffer {
 
 #[derive(Debug)]
 enum Command {
-    Seek(SeekFrom),
+    Seek { generation: u64, pos: SeekFrom },
     Stop,
 }
 
@@ -83,23 +86,25 @@ enum Command {
 /// reader.read(&mut buf).unwrap();
 /// assert_eq!(&buf, b"Hello");
 /// ```
-pub struct SmartBuf<R: Read + Seek + Send> {
+pub struct SmartBuf<R: Read + Seek + Send + 'static> {
     // Channels for communication with background thread
     cmd_send: Option<Sender<Command>>,
     buf_recv: Receiver<io::Result<Buffer>>,
     buf_send: Sender<Option<Buffer>>,
-    
+
     // Current buffer state
     buffer: Option<Buffer>,
-    buf_pos: usize,  // Position within current buffer
-    absolute_pos: u64,  // Absolute position in stream
-    
+    buf_pos: usize, // Position within current buffer
+    position: u64,  // Logical position in stream
+    current_generation: u64,
+    next_generation: u64,
+
     // Configuration
     bufsize: usize,
-    
+
     // Thread handle for cleanup
     handle: Option<JoinHandle<()>>,
-    
+
     // Phantom data to track type parameter
     _phantom: PhantomData<R>,
 }
@@ -128,12 +133,7 @@ impl<R: Read + Seek + Send + 'static> SmartBuf<R> {
             empty_send.send(Some(buffer)).ok();
         }
 
-        let mut background_reader = BackgroundReader::new(
-            empty_recv,
-            full_send,
-            cmd_recv,
-            bufsize,
-        );
+        let mut background_reader = BackgroundReader::new(empty_recv, full_send, cmd_recv, bufsize);
 
         let handle = thread::spawn(move || {
             background_reader.serve(reader);
@@ -145,7 +145,9 @@ impl<R: Read + Seek + Send + 'static> SmartBuf<R> {
             buf_send: empty_send,
             buffer: None,
             buf_pos: 0,
-            absolute_pos: 0,
+            position: 0,
+            current_generation: 0,
+            next_generation: 1,
             bufsize,
             handle: Some(handle),
             _phantom: PhantomData,
@@ -154,7 +156,7 @@ impl<R: Read + Seek + Send + 'static> SmartBuf<R> {
 
     /// Returns the current absolute position in the stream.
     pub fn position(&self) -> u64 {
-        self.absolute_pos
+        self.position
     }
 
     /// Returns the buffer size.
@@ -162,25 +164,50 @@ impl<R: Read + Seek + Send + 'static> SmartBuf<R> {
         self.bufsize
     }
 
-    fn get_next_buffer(&mut self) -> io::Result<()> {
-        // Return current buffer to pool if it exists
+    fn return_current_buffer(&mut self) {
         if let Some(buf) = self.buffer.take() {
             self.buf_send.send(Some(buf)).ok();
         }
+        self.buf_pos = 0;
+    }
 
-        // Get next buffer
-        match self.buf_recv.recv() {
-            Ok(Ok(buffer)) => {
-                self.buffer = Some(buffer);
-                self.buf_pos = 0;
-                Ok(())
+    fn get_next_buffer(&mut self) -> io::Result<()> {
+        self.return_current_buffer();
+
+        loop {
+            match self.buf_recv.recv() {
+                Ok(Ok(buffer)) => {
+                    if buffer.generation != self.current_generation {
+                        self.buf_send.send(Some(buffer)).ok();
+                        continue;
+                    }
+
+                    self.position = buffer.start_pos;
+                    self.buf_pos = 0;
+                    self.buffer = Some(buffer);
+                    return Ok(());
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "background thread terminated",
+                    ));
+                }
             }
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "background thread terminated",
-            )),
         }
+    }
+
+    fn ensure_buffer(&mut self) -> io::Result<()> {
+        if self.buffer.is_none() {
+            self.get_next_buffer()?;
+        }
+        Ok(())
+    }
+
+    fn advance_buffer(&mut self) -> io::Result<()> {
+        self.return_current_buffer();
+        self.get_next_buffer()
     }
 }
 
@@ -193,40 +220,34 @@ impl<R: Read + Seek + Send + 'static> Read for SmartBuf<R> {
         let mut total_read = 0;
 
         while total_read < buf.len() {
-            // Ensure we have a buffer
-            if self.buffer.is_none() {
-                self.get_next_buffer()?;
-            }
+            self.ensure_buffer()?;
 
-            let current = self.buffer.as_ref().unwrap();
-            
-            // Check if we're at the end of current buffer
+            let current = match self.buffer.as_ref() {
+                Some(b) => b,
+                None => break,
+            };
+
             if self.buf_pos >= current.end {
-                // If buffer is empty (EOF), we're done
                 if current.end == 0 {
                     break;
                 }
-                // Buffer exhausted, get next one
-                self.get_next_buffer()?;
+                self.advance_buffer()?;
                 continue;
             }
 
-            // Read from current buffer
             let available = current.end - self.buf_pos;
             let to_read = std::cmp::min(available, buf.len() - total_read);
             let start = self.buf_pos;
             let end = start + to_read;
 
-            buf[total_read..total_read + to_read]
-                .copy_from_slice(&current.data[start..end]);
+            buf[total_read..total_read + to_read].copy_from_slice(&current.data[start..end]);
 
             self.buf_pos += to_read;
-            self.absolute_pos += to_read as u64;
+            self.position = current.start_pos + self.buf_pos as u64;
             total_read += to_read;
 
-            // If we've consumed the entire buffer, get the next one
             if self.buf_pos >= current.end {
-                self.get_next_buffer()?;
+                self.advance_buffer()?;
             }
         }
 
@@ -236,95 +257,94 @@ impl<R: Read + Seek + Send + 'static> Read for SmartBuf<R> {
 
 impl<R: Read + Seek + Send + 'static> Seek for SmartBuf<R> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let target_pos = match pos {
-            SeekFrom::Start(n) => n,
-            SeekFrom::Current(n) => {
-                if n >= 0 {
-                    self.absolute_pos.checked_add(n as u64)
-                } else {
-                    self.absolute_pos.checked_sub((-n) as u64)
+        let (explicit_target, command_pos) = match pos {
+            SeekFrom::Start(n) => (Some(n), SeekFrom::Start(n)),
+            SeekFrom::Current(delta) => {
+                let base = self.position as i128;
+                let target = base + delta as i128;
+                if target < 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "seek before start",
+                    ));
                 }
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "seek overflow")
-                })?
+                let target = target as u64;
+                (Some(target), SeekFrom::Start(target))
             }
-            SeekFrom::End(_n) => {
-                // For SeekFrom::End, we need to know the file size
-                // Send the command to background thread to handle it
-                if let Some(sender) = &self.cmd_send {
-                    // Drain any already-filled buffers from the channel - these are stale
-                    while self.buf_recv.try_recv().is_ok() {}
-                    
-                    sender.send(Command::Seek(pos)).ok();
-                    // Invalidate current buffer and provide empty buffer if needed
-                    if let Some(buf) = self.buffer.take() {
-                        self.buf_send.send(Some(buf)).ok();
-                    } else {
-                        // Provide an empty buffer so background thread can start filling
-                        // We don't know the exact position yet, but the background thread
-                        // will update it after seeking
-                        let empty_buffer = Buffer::new(self.bufsize, 0);
-                        self.buf_send.send(Some(empty_buffer)).ok();
-                    }
-                    self.buf_pos = 0;
-                    // Get new buffer to update absolute_pos
-                    self.get_next_buffer()?;
-                    return Ok(self.absolute_pos);
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "background thread terminated",
-                ));
-            }
+            SeekFrom::End(offset) => (None, SeekFrom::End(offset)),
         };
 
-        // Check if target is within current buffer
-        if let Some(ref buffer) = self.buffer {
-            if target_pos >= buffer.start_pos {
-                let offset = (target_pos - buffer.start_pos) as usize;
-                if offset <= buffer.end {
-                    // Seek is within current buffer
-                    self.buf_pos = offset;
-                    self.absolute_pos = target_pos;
-                    return Ok(target_pos);
+        if let Some(target_pos) = explicit_target {
+            if let Some(ref buffer) = self.buffer {
+                if target_pos >= buffer.start_pos {
+                    let offset = target_pos - buffer.start_pos;
+                    if let Ok(offset_usize) = usize::try_from(offset) {
+                        if offset_usize <= buffer.end {
+                            self.buf_pos = offset_usize;
+                            self.position = target_pos;
+                            return Ok(target_pos);
+                        }
+                    }
                 }
             }
         }
 
-        // Seek is outside current buffer - send command to background thread
-        if let Some(sender) = &self.cmd_send {
-            // Drain any already-filled buffers from the channel - these are stale
-            // and were filled before the seek
-            while self.buf_recv.try_recv().is_ok() {}
-            
-            sender.send(Command::Seek(SeekFrom::Start(target_pos))).ok();
-            // Invalidate current buffer
-            if let Some(buf) = self.buffer.take() {
-                // Return the old buffer to the pool
-                self.buf_send.send(Some(buf)).ok();
-            } else {
-                // If we don't have a buffer, we need to provide an empty one
-                // so the background thread can start filling from the new position
-                let empty_buffer = Buffer::new(self.bufsize, target_pos);
-                self.buf_send.send(Some(empty_buffer)).ok();
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.current_generation = generation;
+        self.return_current_buffer();
+        self.buffer = None;
+        self.buf_pos = 0;
+
+        let sender = self.cmd_send.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "background thread terminated")
+        })?;
+
+        sender
+            .send(Command::Seek {
+                generation,
+                pos: command_pos,
+            })
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "background thread terminated")
+            })?;
+
+        self.get_next_buffer()?;
+
+        let position = if let Some(target_pos) = explicit_target {
+            let buffer = self.buffer.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "missing buffer after seek")
+            })?;
+
+            let offset = target_pos
+                .checked_sub(buffer.start_pos)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before buffer"))?;
+            let offset_usize = usize::try_from(offset).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "seek offset too large")
+            })?;
+            if offset_usize > buffer.end {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "background reader returned buffer not containing target position",
+                ));
             }
-            self.buf_pos = 0;
-            self.absolute_pos = target_pos;
-            // Get new buffer from background thread
-            // Note: This will block until background thread processes the seek
-            self.get_next_buffer()?;
-            Ok(target_pos)
+            self.buf_pos = offset_usize;
+            buffer.start_pos + offset
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "background thread terminated",
-            ))
-        }
+            let buffer = self.buffer.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "missing buffer after seek")
+            })?;
+            buffer.start_pos
+        };
+
+        self.position = position;
+        Ok(position)
     }
 }
 
-impl<R: Read + Seek + Send> Drop for SmartBuf<R> {
+impl<R: Read + Seek + Send + 'static> Drop for SmartBuf<R> {
     fn drop(&mut self) {
+        self.return_current_buffer();
         // Send stop command to background thread
         if let Some(sender) = self.cmd_send.take() {
             sender.send(Command::Stop).ok();
@@ -340,6 +360,7 @@ struct BackgroundReader {
     empty_recv: Receiver<Option<Buffer>>,
     full_send: Sender<io::Result<Buffer>>,
     cmd_recv: Receiver<Command>,
+    current_generation: u64,
 }
 
 impl BackgroundReader {
@@ -353,86 +374,71 @@ impl BackgroundReader {
             empty_recv,
             full_send,
             cmd_recv,
+            current_generation: 0,
         }
     }
 
     fn serve<R: Read + Seek>(&mut self, mut reader: R) {
         let mut current_pos = 0u64;
+        let mut pending_seek = false;
 
         loop {
-            // Check for commands - use blocking recv with timeout-like behavior
-            // We need to handle seeks promptly, but also process buffers
-            let had_command = self.cmd_recv.try_recv().ok().map(|cmd| {
+            // Process any pending commands
+            while let Ok(cmd) = self.cmd_recv.try_recv() {
                 match cmd {
-                    Command::Seek(pos) => {
-                        // Seek the underlying reader
-                        match reader.seek(pos) {
-                            Ok(new_pos) => {
-                                current_pos = new_pos;
-                                // Don't drain buffers - the next buffer we receive
-                                // will be filled from the new position
-                            }
-                            Err(e) => {
-                                self.full_send.send(Err(e)).ok();
-                                return false; // Signal to break
-                            }
+                    Command::Seek { generation, pos } => match reader.seek(pos) {
+                        Ok(new_pos) => {
+                            current_pos = new_pos;
+                            self.current_generation = generation;
+                            pending_seek = true;
                         }
-                        true // Continue
-                    }
-                    Command::Stop => false, // Signal to break
+                        Err(e) => {
+                            self.full_send.send(Err(e)).ok();
+                            return;
+                        }
+                    },
+                    Command::Stop => return,
                 }
-            });
-
-            // If we got a Stop command, break
-            if let Some(false) = had_command {
-                break;
             }
 
-            // Try to get an empty buffer (blocking if we just processed a seek)
-            // Use recv if we just processed a seek, to ensure we get the buffer
-            // that was sent after the seek
-            let buffer_result = if had_command.is_some() {
-                // After a seek, wait for the buffer that was sent
+            let buffer_result = if pending_seek {
+                pending_seek = false;
                 self.empty_recv.recv()
             } else {
-                // Normal operation, use non-blocking
                 match self.empty_recv.try_recv() {
                     Ok(b) => Ok(b),
-                    Err(_) => {
-                        // No buffer and no command, wait a bit
+                    Err(TryRecvError::Empty) => {
                         thread::yield_now();
                         continue;
                     }
+                    Err(TryRecvError::Disconnected) => return,
                 }
             };
 
             match buffer_result {
                 Ok(Some(mut buffer)) => {
-                    // Update buffer start position to current position
                     buffer.start_pos = current_pos;
+                    buffer.generation = self.current_generation;
                     match buffer.refill(&mut reader) {
                         Ok(()) => {
                             current_pos += buffer.end as u64;
-                            self.full_send.send(Ok(buffer)).ok();
+                            if self.full_send.send(Ok(buffer)).is_err() {
+                                return;
+                            }
                         }
                         Err(e) => {
-                            let kind = e.kind();
-                            let should_break = kind != io::ErrorKind::Interrupted;
-                            self.full_send.send(Err(e)).ok();
+                            let should_break = e.kind() != io::ErrorKind::Interrupted;
+                            if self.full_send.send(Err(e)).is_err() {
+                                return;
+                            }
                             if should_break {
-                                break;
+                                return;
                             }
                         }
                     }
                 }
-                Ok(None) => {
-                    // Shutdown signal
-                    break;
-                }
-                Err(_) => {
-                    // Channel closed
-                    break;
-                }
+                Ok(None) => return,
+                Err(_) => return,
             }
         }
     }
@@ -467,7 +473,7 @@ mod tests {
 
         // Seek back within the buffer
         reader.seek(SeekFrom::Start(2)).unwrap();
-        
+
         let mut buf = vec![0; 3];
         reader.read(&mut buf).unwrap();
         assert_eq!(&buf, &[2, 3, 4]);
@@ -485,7 +491,7 @@ mod tests {
 
         // Seek to position outside current buffer
         reader.seek(SeekFrom::Start(20)).unwrap();
-        
+
         let mut buf = vec![0; 5];
         reader.read(&mut buf).unwrap();
         assert_eq!(&buf, &[20, 21, 22, 23, 24]);
@@ -499,7 +505,7 @@ mod tests {
 
         reader.seek(SeekFrom::Current(5)).unwrap();
         assert_eq!(reader.position(), 5);
-        
+
         let mut buf = vec![0; 3];
         reader.read(&mut buf).unwrap();
         assert_eq!(&buf, &[5, 6, 7]);
@@ -519,7 +525,7 @@ mod tests {
         // Seek backward within buffer
         reader.seek(SeekFrom::Current(-5)).unwrap();
         assert_eq!(reader.position(), 5);
-        
+
         let mut buf = vec![0; 3];
         reader.read(&mut buf).unwrap();
         assert_eq!(&buf, &[5, 6, 7]);
@@ -837,7 +843,7 @@ mod tests {
 
         let mut buf = vec![0; 10];
         reader.read_exact(&mut buf).unwrap();
-        
+
         // Should fail on second read_exact since we've exhausted data
         let mut buf2 = vec![0; 10];
         assert!(reader.read_exact(&mut buf2).is_err());
@@ -857,8 +863,11 @@ mod tests {
 
                 let mut result = Vec::new();
                 reader.read_to_end(&mut result).unwrap();
-                assert_eq!(result, data, 
-                    "Failed at bufsize: {}, queuelen: {}", channel_bufsize, queuelen);
+                assert_eq!(
+                    result, data,
+                    "Failed at bufsize: {}, queuelen: {}",
+                    channel_bufsize, queuelen
+                );
             }
         }
     }
@@ -945,7 +954,7 @@ mod tests {
             let mut buf = [0; 5];
             let n = reader.read(&mut buf).unwrap();
             assert_eq!(n, 5);
-            assert_eq!(&buf, &data[i*5..(i+1)*5]);
+            assert_eq!(&buf, &data[i * 5..(i + 1) * 5]);
         }
     }
 
@@ -1078,7 +1087,7 @@ mod tests {
 
         // Seek to end
         reader.seek(SeekFrom::End(0)).unwrap();
-        
+
         // Try to read - should get 0 bytes
         let mut buf = [0; 10];
         let n = reader.read(&mut buf).unwrap();
@@ -1090,5 +1099,959 @@ mod tests {
         assert_eq!(n, 5);
         assert_eq!(&buf[..n], &[20, 21, 22, 23, 24]);
     }
-}
 
+    #[test]
+    fn deadlock_test_queue_length_one() {
+        // Test with minimal buffer pool
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 1, cursor);
+
+        // Read through multiple buffers with queue length of 1
+        // This exercises the buffer return/acquire cycle
+        for _ in 0..10 {
+            let mut buf = vec![0; 10];
+            let n = reader.read(&mut buf).unwrap();
+            assert!(n > 0);
+        }
+    }
+
+    #[test]
+    fn deadlock_test_rapid_successive_seeks() {
+        // Test rapid successive seeks that might cause command queue issues
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Rapid seeks without waiting for each to complete
+        for i in 0..20 {
+            let pos = (i * 5) % 100;
+            reader.seek(SeekFrom::Start(pos)).unwrap();
+            let mut buf = vec![0; 3];
+            let n = reader.read(&mut buf).unwrap();
+            assert!(n > 0);
+            assert_eq!(buf[0], pos as u8);
+        }
+    }
+
+    #[test]
+    fn deadlock_test_seek_while_reading() {
+        // Test seeks interspersed with reads
+        let data: Vec<u8> = (0..200).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read some data
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[0, 1, 2, 3, 4]);
+
+        // Seek while we have a buffer
+        reader.seek(SeekFrom::Start(50)).unwrap();
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[50, 51, 52, 53, 54]);
+
+        // Read more, then seek again
+        reader.read(&mut buf).unwrap();
+        reader.seek(SeekFrom::Start(100)).unwrap();
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[100, 101, 102, 103, 104]);
+    }
+
+    #[test]
+    fn deadlock_test_multiple_seeks_no_read() {
+        // Test multiple seeks in a row without reading
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Chain seeks without reading
+        reader.seek(SeekFrom::Start(10)).unwrap();
+        reader.seek(SeekFrom::Start(20)).unwrap();
+        reader.seek(SeekFrom::Start(30)).unwrap();
+        reader.seek(SeekFrom::Start(40)).unwrap();
+        reader.seek(SeekFrom::Start(50)).unwrap();
+
+        // Now read to verify we're at the right position
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[50, 51, 52, 53, 54]);
+    }
+
+    #[test]
+    fn deadlock_test_seek_current_rapid() {
+        // Test rapid SeekFrom::Current operations
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Rapid SeekFrom::Current operations
+        reader.seek(SeekFrom::Current(10)).unwrap();
+        reader.seek(SeekFrom::Current(10)).unwrap();
+        reader.seek(SeekFrom::Current(10)).unwrap();
+        reader.seek(SeekFrom::Current(-10)).unwrap();
+        reader.seek(SeekFrom::Current(5)).unwrap();
+
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[25, 26, 27, 28, 29]);
+    }
+
+    #[test]
+    fn deadlock_test_seek_end_rapid() {
+        // Test rapid SeekFrom::End operations
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Multiple SeekFrom::End operations
+        reader.seek(SeekFrom::End(-10)).unwrap();
+        reader.seek(SeekFrom::End(-20)).unwrap();
+        reader.seek(SeekFrom::End(-5)).unwrap();
+
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[95, 96, 97, 98, 99]);
+    }
+
+    #[test]
+    fn deadlock_test_interleaved_read_seek() {
+        // Test interleaving reads and seeks
+        let data: Vec<u8> = (0..200).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        let mut buf = vec![0; 3];
+
+        reader.read(&mut buf).unwrap();
+        reader.seek(SeekFrom::Start(50)).unwrap();
+        reader.read(&mut buf).unwrap();
+        reader.seek(SeekFrom::Start(100)).unwrap();
+        reader.read(&mut buf).unwrap();
+        reader.seek(SeekFrom::Start(150)).unwrap();
+        reader.read(&mut buf).unwrap();
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read(&mut buf).unwrap();
+
+        assert_eq!(buf, &[0, 1, 2]);
+    }
+
+    #[test]
+    fn deadlock_test_background_thread_waiting_on_seek() {
+        // Test scenario where background thread is waiting for buffer during seek
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(5, 1, cursor);
+
+        // Read to consume all buffers
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+
+        // Seek - this should work even with queue length 1
+        reader.seek(SeekFrom::Start(50)).unwrap();
+
+        // Read to verify seek worked
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[50, 51, 52, 53, 54]);
+    }
+
+    #[test]
+    fn deadlock_test_seek_without_buffer() {
+        // Test seek when we don't have a current buffer
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Seek immediately without reading first (no buffer held)
+        reader.seek(SeekFrom::Start(50)).unwrap();
+
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[50, 51, 52, 53, 54]);
+    }
+
+    #[test]
+    fn deadlock_test_drop_while_processing() {
+        // Test dropping SmartBuf while background thread is processing
+        // This should not deadlock - background thread should detect Stop command
+        let data: Vec<u8> = (0..255).cycle().take(1000).collect();
+        let cursor = Cursor::new(data);
+
+        // Create and immediately drop
+        {
+            let reader = SmartBuf::with_capacity(10, 2, cursor);
+            drop(reader);
+        }
+        // If we get here, no deadlock occurred
+    }
+
+    #[test]
+    fn deadlock_test_drop_during_read() {
+        // Test dropping while reading is in progress
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data);
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Start reading
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+
+        // Drop immediately after read
+        drop(reader);
+        // If we get here, no deadlock occurred
+    }
+
+    #[test]
+    fn deadlock_test_drop_during_seek() {
+        // Test dropping while seek is in progress
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data);
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Start seek
+        reader.seek(SeekFrom::Start(50)).unwrap();
+
+        // Drop immediately after seek
+        drop(reader);
+        // If we get here, no deadlock occurred
+    }
+
+    #[test]
+    fn deadlock_test_stress_rapid_operations() {
+        // Stress test with rapid operations
+        let data: Vec<u8> = (0..255).cycle().take(500).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Mix of reads and seeks
+        for i in 0..50 {
+            if i % 3 == 0 {
+                reader.seek(SeekFrom::Start((i * 10) as u64)).unwrap();
+            }
+            let mut buf = vec![0; 3];
+            let n = reader.read(&mut buf).unwrap();
+            assert!(n > 0);
+        }
+    }
+
+    #[test]
+    fn deadlock_test_seek_to_same_position_multiple_times() {
+        // Test seeking to the same position multiple times
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Seek to same position multiple times
+        for _ in 0..10 {
+            reader.seek(SeekFrom::Start(50)).unwrap();
+        }
+
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[50, 51, 52, 53, 54]);
+    }
+
+    #[test]
+    fn deadlock_test_seek_forward_then_backward_rapidly() {
+        // Test alternating forward and backward seeks
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Alternate forward and backward
+        reader.seek(SeekFrom::Start(50)).unwrap();
+        reader.seek(SeekFrom::Start(10)).unwrap();
+        reader.seek(SeekFrom::Start(80)).unwrap();
+        reader.seek(SeekFrom::Start(20)).unwrap();
+        reader.seek(SeekFrom::Start(90)).unwrap();
+
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[90, 91, 92, 93, 94]);
+    }
+
+    #[test]
+    fn deadlock_test_read_large_spanning_multiple_buffers_after_seek() {
+        // Test reading large amount that spans buffers after a seek
+        let data: Vec<u8> = (0..200).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Seek to middle
+        reader.seek(SeekFrom::Start(100)).unwrap();
+
+        // Read large amount that spans multiple buffers
+        let mut buf = vec![0; 50];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 50);
+        assert_eq!(&buf, &data[100..150]);
+    }
+
+    #[test]
+    fn deadlock_test_seek_while_buffer_is_full() {
+        // Test seeking when we have a full buffer
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read to fill buffer
+        let mut buf = vec![0; 10];
+        reader.read(&mut buf).unwrap();
+
+        // Seek while we have a full buffer
+        reader.seek(SeekFrom::Start(50)).unwrap();
+
+        // Read again
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[50, 51, 52, 53, 54, 55, 56, 57, 58, 59]);
+    }
+
+    #[test]
+    fn deadlock_test_seek_while_buffer_is_partially_read() {
+        // Test seeking when we have a partially read buffer
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read part of buffer
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[0, 1, 2, 3, 4]);
+
+        // Seek while we have a partially read buffer
+        reader.seek(SeekFrom::Start(50)).unwrap();
+
+        // Read again
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[50, 51, 52, 53, 54]);
+    }
+
+    #[test]
+    fn deadlock_test_multiple_seek_current_operations() {
+        // Test multiple SeekFrom::Current operations in sequence
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Chain SeekFrom::Current operations
+        reader.seek(SeekFrom::Current(10)).unwrap();
+        reader.seek(SeekFrom::Current(10)).unwrap();
+        reader.seek(SeekFrom::Current(-5)).unwrap();
+        reader.seek(SeekFrom::Current(15)).unwrap();
+
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[30, 31, 32, 33, 34]);
+    }
+
+    #[test]
+    fn deadlock_test_seek_end_then_seek_start() {
+        // Test seeking to end then to start
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        reader.seek(SeekFrom::End(0)).unwrap();
+        reader.seek(SeekFrom::Start(0)).unwrap();
+
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn deadlock_test_seek_current_negative_beyond_buffer() {
+        // Test SeekFrom::Current with large negative value
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read forward
+        reader.seek(SeekFrom::Start(50)).unwrap();
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+
+        // Seek backward beyond current buffer
+        reader.seek(SeekFrom::Current(-40)).unwrap();
+
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[15, 16, 17, 18, 19]);
+    }
+
+    #[test]
+    fn deadlock_test_minimal_buffer_size() {
+        // Test with minimal buffer size (1 byte)
+        let data: Vec<u8> = (0..50).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(1, 1, cursor);
+
+        // Read and seek operations
+        for i in 0..10 {
+            reader.seek(SeekFrom::Start(i)).unwrap();
+            let mut buf = vec![0; 1];
+            let n = reader.read(&mut buf).unwrap();
+            assert_eq!(n, 1);
+            assert_eq!(buf[0], i as u8);
+        }
+    }
+
+    #[test]
+    fn deadlock_test_all_buffers_in_use() {
+        // Test scenario where all buffers are in use
+        let data: Vec<u8> = (0..200).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read through multiple buffers to ensure all are in use
+        for _ in 0..10 {
+            let mut buf = vec![0; 10];
+            reader.read(&mut buf).unwrap();
+        }
+
+        // Now seek - should still work
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn deadlock_test_rapid_seek_current_forward_backward() {
+        // Test rapid SeekFrom::Current with forward and backward
+        let data: Vec<u8> = (0..200).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Rapid forward and backward seeks
+        reader.seek(SeekFrom::Current(20)).unwrap();
+        reader.seek(SeekFrom::Current(20)).unwrap();
+        reader.seek(SeekFrom::Current(-10)).unwrap();
+        reader.seek(SeekFrom::Current(20)).unwrap();
+        reader.seek(SeekFrom::Current(-15)).unwrap();
+
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[35, 36, 37, 38, 39]);
+    }
+
+    #[test]
+    fn deadlock_test_seek_after_eof() {
+        // Test seeking after reaching EOF
+        let data: Vec<u8> = (0..50).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read to EOF
+        let mut buf = vec![0; 100];
+        reader.read(&mut buf).unwrap();
+
+        // Seek after EOF
+        reader.seek(SeekFrom::Start(10)).unwrap();
+        reader.read(&mut buf).unwrap();
+        assert_eq!(&buf[..40], &data[10..50]);
+    }
+
+    #[test]
+    fn edge_case_empty_file() {
+        // Test with empty file
+        let data: Vec<u8> = vec![];
+        let cursor = Cursor::new(data);
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read should return 0
+        let mut buf = vec![0; 10];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+
+        // Seek to start should work
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(reader.position(), 0);
+
+        // Read again should return 0
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn edge_case_buffer_larger_than_file() {
+        // Test with buffer size larger than file size
+        let data: Vec<u8> = (0..10).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(100, 2, cursor);
+
+        // Should read entire file in one buffer
+        let mut buf = vec![0; 100];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(&buf[..n], &data[..]);
+    }
+
+    #[test]
+    fn edge_case_seek_to_file_end() {
+        // Test seeking to exactly the end of file
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Seek to end
+        reader.seek(SeekFrom::Start(20)).unwrap();
+        assert_eq!(reader.position(), 20);
+
+        // Read should return 0
+        let mut buf = vec![0; 10];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn edge_case_seek_beyond_file_end() {
+        // Test seeking beyond file end
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Seek beyond end
+        reader.seek(SeekFrom::Start(50)).unwrap();
+        assert_eq!(reader.position(), 50);
+
+        // Read should return 0 (EOF)
+        let mut buf = vec![0; 10];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn edge_case_read_exactly_buffer_size() {
+        // Test reading exactly buffer size
+        let data: Vec<u8> = (0..30).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read exactly one buffer
+        let mut buf = vec![0; 10];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(&buf, &data[..10]);
+
+        // Next read should get next buffer
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(&buf, &data[10..20]);
+    }
+
+    #[test]
+    fn edge_case_read_multiple_of_buffer_size() {
+        // Test reading multiple times buffer size
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read exactly 5 buffers worth
+        let mut buf = vec![0; 50];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 50);
+        assert_eq!(&buf, &data[..50]);
+    }
+
+    #[test]
+    fn edge_case_seek_current_zero() {
+        // Test SeekFrom::Current(0) - should be no-op
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read some
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(reader.position(), 5);
+
+        // Seek current by 0
+        reader.seek(SeekFrom::Current(0)).unwrap();
+        assert_eq!(reader.position(), 5);
+
+        // Should continue reading from same position
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn edge_case_seek_current_large_forward() {
+        // Test SeekFrom::Current with very large forward value
+        let data: Vec<u8> = (0..200).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        reader.seek(SeekFrom::Current(100)).unwrap();
+        assert_eq!(reader.position(), 100);
+
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[100, 101, 102, 103, 104]);
+    }
+
+    #[test]
+    fn edge_case_seek_current_large_backward() {
+        // Test SeekFrom::Current with very large backward value
+        let data: Vec<u8> = (0..200).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Move forward first
+        reader.seek(SeekFrom::Start(100)).unwrap();
+        assert_eq!(reader.position(), 100);
+
+        // Seek backward
+        reader.seek(SeekFrom::Current(-80)).unwrap();
+        assert_eq!(reader.position(), 20);
+
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[20, 21, 22, 23, 24]);
+    }
+
+    #[test]
+    fn edge_case_seek_from_end_positive() {
+        // Test SeekFrom::End with positive offset
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Seek from end with positive offset (beyond end)
+        let pos = reader.seek(SeekFrom::End(10)).unwrap();
+        // The position should be file_size + offset = 20 + 10 = 30
+        // The seek operation returns the actual position
+        assert_eq!(pos, 30);
+
+        // Position should match what was returned
+        assert_eq!(reader.position(), pos);
+
+        // Read should return 0 (EOF)
+        let mut buf = vec![0; 10];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn edge_case_seek_from_end_at_start() {
+        // Test SeekFrom::End(-file_size) should go to start
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        reader.seek(SeekFrom::End(-20)).unwrap();
+        assert_eq!(reader.position(), 0);
+
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn edge_case_seek_from_end_beyond_start() {
+        // Test SeekFrom::End with offset larger than file size
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // This should cause an error due to overflow
+        assert!(reader.seek(SeekFrom::End(-100)).is_err());
+    }
+
+    #[test]
+    fn edge_case_position_tracking_through_multiple_operations() {
+        // Test position tracking accuracy through complex operations
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        assert_eq!(reader.position(), 0);
+
+        // Read
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(reader.position(), 5);
+
+        // Seek
+        reader.seek(SeekFrom::Start(20)).unwrap();
+        assert_eq!(reader.position(), 20);
+
+        // Read
+        reader.read(&mut buf).unwrap();
+        assert_eq!(reader.position(), 25);
+
+        // Seek current
+        reader.seek(SeekFrom::Current(-10)).unwrap();
+        assert_eq!(reader.position(), 15);
+
+        // Read
+        reader.read(&mut buf).unwrap();
+        assert_eq!(reader.position(), 20);
+    }
+
+    #[test]
+    fn edge_case_read_zero_bytes() {
+        // Test reading zero bytes
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read zero bytes should return 0 immediately
+        let mut buf = vec![0; 0];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+
+        // Position should not change
+        assert_eq!(reader.position(), 0);
+    }
+
+    #[test]
+    fn edge_case_read_exact_insufficient_data() {
+        // Test read_exact when there's insufficient data
+        let data: Vec<u8> = (0..10).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(5, 2, cursor);
+
+        // Try to read more than available
+        let mut buf = vec![0; 20];
+        let result = reader.read_exact(&mut buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn edge_case_read_exact_exact_amount() {
+        // Test read_exact with exact amount available
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read exact amount
+        let mut buf = vec![0; 20];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, &data[..]);
+    }
+
+    #[test]
+    fn edge_case_seek_to_same_position_multiple_times() {
+        // Test seeking to same position repeatedly
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Seek to same position multiple times
+        for _ in 0..5 {
+            reader.seek(SeekFrom::Start(10)).unwrap();
+            assert_eq!(reader.position(), 10);
+        }
+
+        // Should still read correctly
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn edge_case_seek_within_buffer_multiple_times() {
+        // Test seeking within buffer multiple times
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(20, 2, cursor);
+
+        // Read to fill buffer
+        let mut buf = vec![0; 10];
+        reader.read(&mut buf).unwrap();
+
+        // Seek within buffer multiple times
+        reader.seek(SeekFrom::Start(5)).unwrap();
+        reader.seek(SeekFrom::Start(3)).unwrap();
+        reader.seek(SeekFrom::Start(7)).unwrap();
+        reader.seek(SeekFrom::Start(2)).unwrap();
+
+        // Should read from last seek position
+        reader.read(&mut buf).unwrap();
+        assert_eq!(&buf[..5], &[2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn edge_case_read_to_end_multiple_times() {
+        // Test read_to_end called multiple times
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // First read_to_end
+        let mut result = Vec::new();
+        reader.read_to_end(&mut result).unwrap();
+        assert_eq!(result, data.clone());
+
+        // Second read_to_end should return empty
+        let mut result2 = Vec::new();
+        reader.read_to_end(&mut result2).unwrap();
+        assert_eq!(result2, vec![]);
+    }
+
+    #[test]
+    fn edge_case_seek_after_read_to_end() {
+        // Test seeking after read_to_end
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read to end
+        let mut result = Vec::new();
+        reader.read_to_end(&mut result).unwrap();
+
+        // Seek back
+        reader.seek(SeekFrom::Start(5)).unwrap();
+
+        // Should be able to read again
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn edge_case_large_queue_length() {
+        // Test with very large queue length
+        let data: Vec<u8> = (0..100).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 20, cursor);
+
+        // Should work normally
+        let mut result = Vec::new();
+        reader.read_to_end(&mut result).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn edge_case_very_small_buffer_size() {
+        // Test with very small buffer size (1 byte)
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(1, 2, cursor);
+
+        // Read should work
+        let mut buf = vec![0; 20];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 20);
+        assert_eq!(&buf[..n], &data[..]);
+    }
+
+    #[test]
+    fn edge_case_read_single_byte_multiple_times() {
+        // Test reading one byte at a time
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Read one byte at a time
+        for i in 0..20 {
+            let mut buf = vec![0; 1];
+            let n = reader.read(&mut buf).unwrap();
+            assert_eq!(n, 1);
+            assert_eq!(buf[0], i);
+            assert_eq!(reader.position(), (i + 1) as u64);
+        }
+    }
+
+    #[test]
+    fn edge_case_seek_then_read_partial() {
+        // Test seeking then reading only part of buffer
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Seek to middle
+        reader.seek(SeekFrom::Start(10)).unwrap();
+
+        // Read only part of buffer
+        let mut buf = vec![0; 3];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[10, 11, 12]);
+
+        // Seek again and read more
+        reader.seek(SeekFrom::Start(15)).unwrap();
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[15, 16, 17]);
+    }
+
+    #[test]
+    fn edge_case_seek_current_at_start() {
+        // Test SeekFrom::Current at start of file
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Seek from current at start
+        reader.seek(SeekFrom::Current(5)).unwrap();
+        assert_eq!(reader.position(), 5);
+
+        let mut buf = vec![0; 5];
+        reader.read(&mut buf).unwrap();
+        assert_eq!(buf, &[5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn edge_case_seek_current_negative_at_start() {
+        // Test SeekFrom::Current with negative at start (should error)
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // Should error due to overflow
+        assert!(reader.seek(SeekFrom::Current(-1)).is_err());
+    }
+
+    #[test]
+    fn edge_case_buffer_exactly_one_byte() {
+        // Test with buffer size of 1 and queue length of 1
+        let data: Vec<u8> = (0..10).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(1, 1, cursor);
+
+        // Should still work
+        let mut result = Vec::new();
+        reader.read_to_end(&mut result).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn edge_case_seek_from_end_zero() {
+        // Test SeekFrom::End(0) - should go to end
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        // SeekFrom::End(0) should position at end of file
+        let pos = reader.seek(SeekFrom::End(0)).unwrap();
+        // The position should be file_size = 20
+        assert_eq!(pos, 20);
+        assert_eq!(reader.position(), 20);
+
+        // Read should return 0
+        let mut buf = vec![0; 10];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn edge_case_read_after_seek_to_exact_end() {
+        // Test reading after seeking to exact end
+        let data: Vec<u8> = (0..20).collect();
+        let cursor = Cursor::new(data.clone());
+        let mut reader = SmartBuf::with_capacity(10, 2, cursor);
+
+        reader.seek(SeekFrom::Start(20)).unwrap();
+        assert_eq!(reader.position(), 20);
+
+        // Read should return 0
+        let mut buf = vec![0; 10];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+
+        // Seek back and read should work
+        reader.seek(SeekFrom::Start(10)).unwrap();
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(&buf, &data[10..20]);
+    }
+}
