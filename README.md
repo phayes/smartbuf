@@ -7,6 +7,18 @@ A high-performance buffered reader with background thread pre-fetching and full 
 - **Full seek support** with optimization for seeks within buffered data
 - **Configurable buffer sizes** and queue lengths for fine-tuning performance
 
+## Use Cases
+
+`SmartBuf` is particularly well-suited for wrapping readers that perform **network requests** or other **slow or inconsistent I/O operations**. The background thread pre-fetching helps mask latency by reading data ahead of time, while the buffering system handles variability in network speed and reliability.
+
+Common scenarios include:
+- **HTTP/HTTPS responses**: Wrapping network stream readers from libraries like `reqwest`, `hyper`, or `ureq`
+- **Remote file access**: Reading from cloud storage APIs or remote file systems
+- **Database BLOB streams**: Reading large binary objects from databases over network connections
+- **Any slow or variable-latency I/O**: Situations where read operations may block or take inconsistent amounts of time
+
+For fast local I/O (like reading from memory or fast SSDs), the overhead of background threading may outweigh the benefits, and standard buffered readers may be more appropriate.
+
 ## Features
 
 - **Background thread pre-fetching**: Data is read ahead of time in a background thread, reducing blocking on I/O operations
@@ -131,34 +143,6 @@ let mut reader = SmartBuf::new(cursor);
 let mut contents = Vec::new();
 reader.read_to_end(&mut contents).unwrap();
 ```
-
-## API Documentation
-
-### `SmartBuf::new(reader: R) -> SmartBuf<R>`
-
-Creates a new `SmartBuf` with default settings:
-- Buffer size: 8KB
-- Queue length: 2
-
-### `SmartBuf::with_capacity(bufsize: usize, queuelen: usize, reader: R) -> SmartBuf<R>`
-
-Creates a new `SmartBuf` with custom configuration:
-- `bufsize`: Size of each buffer chunk in bytes
-- `queuelen`: Number of buffers to keep in the pre-fetch queue (must be ≥ 1)
-
-### `SmartBuf::position(&self) -> u64`
-
-Returns the current absolute position in the stream.
-
-### `SmartBuf::buffer_size(&self) -> usize`
-
-Returns the configured buffer size.
-
-## Performance Considerations
-
-- **Buffer size**: Larger buffers reduce the number of system calls but increase memory usage. A good default is 8KB–64KB.
-- **Queue length**: More buffers in the queue allow for better pre-fetching, especially when reading sequentially. Values of 2–4 are usually sufficient.
-- **Seek optimization**: Seeks within the currently buffered data are handled instantly. Seeks outside the buffer require synchronization with the background thread.
 
 ## Examples
 
